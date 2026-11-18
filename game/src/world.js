@@ -1,124 +1,90 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+// City generation for Azura Bay: road grid, sidewalks, buildings with collision, props,
+// parked-car spots, district lookup and spatial helpers shared by every other system.
+import { WORLD_W, WORLD_H, ROAD_XS, ROAD_YS, ROAD_HALF, BUILDING_COLORS, districtAt } from './config.js';
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+export function isOnRoadX(x) { return ROAD_XS.some((rx) => Math.abs(x - rx) <= ROAD_HALF); }
+export function isOnRoadY(y) { return ROAD_YS.some((ry) => Math.abs(y - ry) <= ROAD_HALF); }
+export function isOnRoad(x, y) { return isOnRoadX(x) || isOnRoadY(y); }
+export function nearestRoadX(x) { let b = ROAD_XS[0]; for (const rx of ROAD_XS) if (Math.abs(rx - x) < Math.abs(b - x)) b = rx; return b; }
+export function nearestRoadY(y) { let b = ROAD_YS[0]; for (const ry of ROAD_YS) if (Math.abs(ry - y) < Math.abs(b - y)) b = ry; return b; }
+export { districtAt };
 
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
+export function createWorld(rand) {
+  const buildings = [];
+  const props = [];
+  const parkSpots = [];
 
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
-}
-
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
+  // Fill each city block (the land between roads) with 1-4 buildings, leaving sidewalk margins.
+  for (let bi = 0; bi < ROAD_XS.length - 1; bi++) {
+    for (let bj = 0; bj < ROAD_YS.length - 1; bj++) {
+      const bx0 = ROAD_XS[bi] + ROAD_HALF + 26;
+      const bx1 = ROAD_XS[bi + 1] - ROAD_HALF - 26;
+      const by0 = ROAD_YS[bj] + ROAD_HALF + 26;
+      const by1 = ROAD_YS[bj + 1] - ROAD_HALF - 26;
+      const bw = bx1 - bx0, bh = by1 - by0;
+      const cols = bw > 340 ? 2 : 1;
+      const rows = bh > 340 ? 2 : 1;
+      for (let cx = 0; cx < cols; cx++) {
+        for (let cy = 0; cy < rows; cy++) {
+          const pad = 14;
+          const x = bx0 + (bw / cols) * cx + pad;
+          const y = by0 + (bh / rows) * cy + pad;
+          const w = bw / cols - pad * 2 - rand() * 30;
+          const h = bh / rows - pad * 2 - rand() * 30;
+          buildings.push({
+            x, y, w, h,
+            color: BUILDING_COLORS[Math.floor(rand() * BUILDING_COLORS.length)],
+            floors: 3 + Math.floor(rand() * 9),
+            district: districtAt(x + w / 2, y + h / 2).name,
+          });
+        }
+      }
+      // Palms and lamps decorate block corners.
+      props.push({ kind: 'palm', x: bx0 - 8, y: by0 - 8 });
+      props.push({ kind: 'lamp', x: bx1 + 8, y: by0 - 8 });
+      props.push({ kind: 'palm', x: bx1 + 8, y: by1 + 8 });
+      props.push({ kind: 'lamp', x: bx0 - 8, y: by1 + 8 });
+    }
   }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
+  // Extra lamps along every road.
+  for (const rx of ROAD_XS) for (let y = 120; y < WORLD_H; y += 260) props.push({ kind: 'lamp', x: rx - ROAD_HALF - 10, y });
+  for (const ry of ROAD_YS) for (let x = 120; x < WORLD_W; x += 260) props.push({ kind: 'lamp', x, y: ry - ROAD_HALF - 10 });
 
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
+  // Parked-car spots hug the kerbs of vertical roads.
+  for (const rx of ROAD_XS) {
+    for (let y = 180; y < WORLD_H - 100; y += 190) {
+      if (isOnRoadY(y)) continue;
+      parkSpots.push({ x: rx - ROAD_HALF + 22, y, angle: -Math.PI / 2 });
+      parkSpots.push({ x: rx + ROAD_HALF - 22, y: y + 90, angle: Math.PI / 2 });
+    }
   }
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
+  function hitsBuilding(x, y, r) {
+    for (const b of buildings) {
+      if (x + r > b.x && x - r < b.x + b.w && y + r > b.y && y - r < b.y + b.h) return b;
+    }
     return null;
   }
 
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
+  // Move a circle by (dx,dy), sliding along building faces and world bounds.
+  function moveCircle(pos, dx, dy, r) {
+    let nx = pos.x + dx;
+    if (!hitsBuilding(nx, pos.y, r) && nx > r && nx < WORLD_W - r) pos.x = nx;
+    let ny = pos.y + dy;
+    if (!hitsBuilding(pos.x, ny, r) && ny > r && ny < WORLD_H - r) pos.y = ny;
   }
 
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
-  }
-
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
+  // Move a rotated car rectangle: sample its four corners plus centre against buildings.
+  function carBlocked(x, y, angle, len, wid) {
+    const c = Math.cos(angle), s = Math.sin(angle);
+    const pts = [[0, 0], [len / 2, wid / 2], [len / 2, -wid / 2], [-len / 2, wid / 2], [-len / 2, -wid / 2]];
+    for (const [lx, ly] of pts) {
+      const wx = x + lx * c - ly * s, wy = y + lx * s + ly * c;
+      if (wx < 8 || wx > WORLD_W - 8 || wy < 8 || wy > WORLD_H - 8) return true;
+      if (hitsBuilding(wx, wy, 2)) return true;
     }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
-
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
-      }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
-        }
-      }
-    }
-    return events;
+    return false;
   }
 
-  reset();
-  return { state, reset, step };
+  return { buildings, props, parkSpots, hitsBuilding, moveCircle, carBlocked, width: WORLD_W, height: WORLD_H };
 }
